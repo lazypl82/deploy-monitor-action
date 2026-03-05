@@ -26,7 +26,11 @@ inputs:
     required: false
     default: production
   include-github-context:
-    description: Append repo/commit/workflow metadata to note
+    description: Include GitHub context fields in deployment metadata
+    required: false
+    default: "true"
+  legacy-fallback:
+    description: Retry without metadata on HTTP 422 (for older Relivio servers)
     required: false
     default: "true"
   idempotency-key:
@@ -48,6 +52,9 @@ outputs:
   status-code:
     description: HTTP status code returned by Relivio
     value: ${{ steps.relivio.outputs.status-code }}
+  used-legacy-fallback:
+    description: true when request was retried without metadata
+    value: ${{ steps.relivio.outputs.used-legacy-fallback }}
 
 runs:
   using: composite
@@ -61,6 +68,7 @@ runs:
         INPUT_NOTE: ${{ inputs.note }}
         INPUT_ENVIRONMENT: ${{ inputs.environment }}
         INPUT_INCLUDE_GITHUB_CONTEXT: ${{ inputs.include-github-context }}
+        INPUT_LEGACY_FALLBACK: ${{ inputs.legacy-fallback }}
         INPUT_IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
         INPUT_TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
       run: |
@@ -80,43 +88,92 @@ runs:
           exit 1
         fi
 
-        final_note="${INPUT_NOTE:-}"
-        if [ -n "${INPUT_ENVIRONMENT:-}" ]; then
-          if [ -n "${final_note}" ]; then
-            final_note="${final_note} | "
-          fi
-          final_note="${final_note}env=${INPUT_ENVIRONMENT}"
-        fi
-        if [ "${INPUT_INCLUDE_GITHUB_CONTEXT}" = "true" ]; then
-          metadata=""
-          if [ -n "${GITHUB_REPOSITORY:-}" ]; then
-            metadata="${metadata} repo=${GITHUB_REPOSITORY}"
-          fi
-          if [ -n "${GITHUB_SHA:-}" ]; then
-            metadata="${metadata} commit=${GITHUB_SHA}"
-          fi
-          if [ -n "${GITHUB_WORKFLOW:-}" ]; then
-            metadata="${metadata} workflow=${GITHUB_WORKFLOW}"
-          fi
-          if [ -n "${GITHUB_RUN_ID:-}" ]; then
-            metadata="${metadata} run_id=${GITHUB_RUN_ID}"
-          fi
-          metadata="${metadata# }"
-          if [ -n "${metadata}" ]; then
-            if [ -n "${final_note}" ]; then
-              final_note="${final_note} | "
-            fi
-            final_note="${final_note}${metadata}"
-          fi
-        fi
-        if [ "${#final_note}" -gt 2000 ]; then
-          final_note="${final_note:0:2000}"
-        fi
+        note="${INPUT_NOTE:-}"
+        environment="${INPUT_ENVIRONMENT:-}"
+        include_context="${INPUT_INCLUDE_GITHUB_CONTEXT:-true}"
+        legacy_fallback="${INPUT_LEGACY_FALLBACK:-true}"
+        repo="${GITHUB_REPOSITORY:-}"
+        commit="${GITHUB_SHA:-}"
+        workflow="${GITHUB_WORKFLOW:-}"
+        run_id="${GITHUB_RUN_ID:-}"
+
+        metadata="$(
+          jq -cn \
+            --arg environment "${environment}" \
+            --arg include_context "${include_context}" \
+            --arg repo "${repo}" \
+            --arg commit "${commit}" \
+            --arg workflow "${workflow}" \
+            --arg run_id "${run_id}" \
+            '
+            (if ($environment | length) > 0 then {environment: $environment} else {} end)
+            + (
+              if $include_context == "true" then
+                (if ($repo | length) > 0 then {repo: $repo} else {} end)
+                + (if ($commit | length) > 0 then {commit: $commit} else {} end)
+                + (if ($workflow | length) > 0 then {workflow: $workflow} else {} end)
+                + (if ($run_id | length) > 0 then {run_id: $run_id} else {} end)
+              else
+                {}
+              end
+            )'
+        )"
 
         payload="$(
           jq -cn \
             --arg version "${version}" \
-            --arg note "${final_note}" \
+            --arg note "${note}" \
+            --argjson metadata "${metadata}" \
+            '{version: $version}
+            + (if ($note | length) > 0 then {note: $note} else {} end)
+            + (if ($metadata | keys | length) > 0 then {metadata: $metadata} else {} end)'
+        )"
+        has_metadata="$(printf "%s" "${payload}" | jq -r 'has("metadata")')"
+
+        legacy_context=""
+        if [ -n "${environment}" ]; then
+          legacy_context="env=${environment}"
+        fi
+        if [ "${include_context}" = "true" ]; then
+          if [ -n "${repo}" ]; then
+            if [ -n "${legacy_context}" ]; then
+              legacy_context="${legacy_context} | "
+            fi
+            legacy_context="${legacy_context}repo=${repo}"
+          fi
+          if [ -n "${commit}" ]; then
+            if [ -n "${legacy_context}" ]; then
+              legacy_context="${legacy_context} | "
+            fi
+            legacy_context="${legacy_context}commit=${commit}"
+          fi
+          if [ -n "${workflow}" ]; then
+            if [ -n "${legacy_context}" ]; then
+              legacy_context="${legacy_context} | "
+            fi
+            legacy_context="${legacy_context}workflow=${workflow}"
+          fi
+          if [ -n "${run_id}" ]; then
+            if [ -n "${legacy_context}" ]; then
+              legacy_context="${legacy_context} | "
+            fi
+            legacy_context="${legacy_context}run_id=${run_id}"
+          fi
+        fi
+        legacy_note="${note}"
+        if [ -n "${legacy_context}" ]; then
+          if [ -n "${legacy_note}" ]; then
+            legacy_note="${legacy_note} | "
+          fi
+          legacy_note="${legacy_note}${legacy_context}"
+        fi
+        if [ "${#legacy_note}" -gt 2000 ]; then
+          legacy_note="${legacy_note:0:2000}"
+        fi
+        legacy_payload="$(
+          jq -cn \
+            --arg version "${version}" \
+            --arg note "${legacy_note}" \
             '{version: $version} + (if ($note | length) > 0 then {note: $note} else {} end)'
         )"
 
@@ -124,23 +181,35 @@ runs:
         response_file="$(mktemp)"
         trap 'rm -f "${response_file}"' EXIT
 
-        curl_args=(
-          -sS
-          -o "${response_file}"
-          -w "%{http_code}"
-          --connect-timeout "${INPUT_TIMEOUT_SECONDS}"
-          --max-time "${INPUT_TIMEOUT_SECONDS}"
-          -X POST "${endpoint}"
-          -H "Content-Type: application/json"
-          -H "X-API-Key: ${INPUT_API_KEY}"
-          --data "${payload}"
-        )
-        if [ -n "${INPUT_IDEMPOTENCY_KEY}" ]; then
-          curl_args+=(-H "Idempotency-Key: ${INPUT_IDEMPOTENCY_KEY}")
-        fi
+        send_payload() {
+          local request_payload="$1"
+          local -a curl_args=(
+            -sS
+            -o "${response_file}"
+            -w "%{http_code}"
+            --connect-timeout "${INPUT_TIMEOUT_SECONDS}"
+            --max-time "${INPUT_TIMEOUT_SECONDS}"
+            -X POST "${endpoint}"
+            -H "Content-Type: application/json"
+            -H "X-API-Key: ${INPUT_API_KEY}"
+            --data "${request_payload}"
+          )
+          if [ -n "${INPUT_IDEMPOTENCY_KEY}" ]; then
+            curl_args+=(-H "Idempotency-Key: ${INPUT_IDEMPOTENCY_KEY}")
+          fi
+          curl "${curl_args[@]}"
+        }
 
-        status_code="$(curl "${curl_args[@]}")"
+        status_code="$(send_payload "${payload}")"
         body="$(cat "${response_file}")"
+        used_legacy_fallback="false"
+
+        if [ "${status_code}" -eq 422 ] && [ "${has_metadata}" = "true" ] && [ "${legacy_fallback}" = "true" ]; then
+          echo "Relivio API returned 422 with metadata. Retrying legacy payload without metadata..." >&2
+          status_code="$(send_payload "${legacy_payload}")"
+          body="$(cat "${response_file}")"
+          used_legacy_fallback="true"
+        fi
 
         if [ "${status_code}" -lt 200 ] || [ "${status_code}" -ge 300 ]; then
           echo "Relivio API request failed (HTTP ${status_code})" >&2
@@ -155,4 +224,5 @@ runs:
           echo "deployment-id=${deployment_id}"
           echo "summary-scheduled=${summary_scheduled}"
           echo "status-code=${status_code}"
+          echo "used-legacy-fallback=${used_legacy_fallback}"
         } >> "${GITHUB_OUTPUT}"
