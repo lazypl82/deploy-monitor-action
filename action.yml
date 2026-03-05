@@ -21,15 +21,30 @@ inputs:
     description: Optional deployment note
     required: false
     default: ""
+  environment:
+    description: Deployment environment label (for example production, staging)
+    required: false
+    default: production
+  include-github-context:
+    description: Append repo/commit/workflow metadata to note
+    required: false
+    default: "true"
   idempotency-key:
     description: Optional Idempotency-Key header
     required: false
     default: ""
+  timeout-seconds:
+    description: Request timeout in seconds
+    required: false
+    default: "15"
 
 outputs:
   deployment-id:
     description: Deployment id returned by Relivio
     value: ${{ steps.relivio.outputs.deployment-id }}
+  summary-scheduled:
+    description: summary_scheduled returned by Relivio (true/false)
+    value: ${{ steps.relivio.outputs.summary-scheduled }}
   status-code:
     description: HTTP status code returned by Relivio
     value: ${{ steps.relivio.outputs.status-code }}
@@ -44,9 +59,17 @@ runs:
         INPUT_API_BASE_URL: ${{ inputs.api-base-url }}
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_NOTE: ${{ inputs.note }}
+        INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        INPUT_INCLUDE_GITHUB_CONTEXT: ${{ inputs.include-github-context }}
         INPUT_IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
+        INPUT_TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
       run: |
         set -euo pipefail
+
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "jq is required on this runner." >&2
+          exit 1
+        fi
 
         version="${INPUT_VERSION:-}"
         if [ -z "${version}" ]; then
@@ -57,9 +80,44 @@ runs:
           exit 1
         fi
 
+        final_note="${INPUT_NOTE:-}"
+        if [ -n "${INPUT_ENVIRONMENT:-}" ]; then
+          if [ -n "${final_note}" ]; then
+            final_note="${final_note} | "
+          fi
+          final_note="${final_note}env=${INPUT_ENVIRONMENT}"
+        fi
+        if [ "${INPUT_INCLUDE_GITHUB_CONTEXT}" = "true" ]; then
+          metadata=""
+          if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+            metadata="${metadata} repo=${GITHUB_REPOSITORY}"
+          fi
+          if [ -n "${GITHUB_SHA:-}" ]; then
+            metadata="${metadata} commit=${GITHUB_SHA}"
+          fi
+          if [ -n "${GITHUB_WORKFLOW:-}" ]; then
+            metadata="${metadata} workflow=${GITHUB_WORKFLOW}"
+          fi
+          if [ -n "${GITHUB_RUN_ID:-}" ]; then
+            metadata="${metadata} run_id=${GITHUB_RUN_ID}"
+          fi
+          metadata="${metadata# }"
+          if [ -n "${metadata}" ]; then
+            if [ -n "${final_note}" ]; then
+              final_note="${final_note} | "
+            fi
+            final_note="${final_note}${metadata}"
+          fi
+        fi
+        if [ "${#final_note}" -gt 2000 ]; then
+          final_note="${final_note:0:2000}"
+        fi
+
         payload="$(
-          VERSION="${version}" NOTE="${INPUT_NOTE}" \
-            python3 -c 'import json, os; body={"version": os.environ["VERSION"]}; note=os.environ.get("NOTE",""); body.update({"note": note} if note else {}); print(json.dumps(body, ensure_ascii=True, separators=(",", ":")))' \
+          jq -cn \
+            --arg version "${version}" \
+            --arg note "${final_note}" \
+            '{version: $version} + (if ($note | length) > 0 then {note: $note} else {} end)'
         )"
 
         endpoint="${INPUT_API_BASE_URL%/}/api/v1/deployments"
@@ -70,6 +128,8 @@ runs:
           -sS
           -o "${response_file}"
           -w "%{http_code}"
+          --connect-timeout "${INPUT_TIMEOUT_SECONDS}"
+          --max-time "${INPUT_TIMEOUT_SECONDS}"
           -X POST "${endpoint}"
           -H "Content-Type: application/json"
           -H "X-API-Key: ${INPUT_API_KEY}"
@@ -88,9 +148,11 @@ runs:
           exit 1
         fi
 
-        deployment_id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${response_file}" | head -n 1)"
+        deployment_id="$(jq -r '.id // empty' "${response_file}" 2>/dev/null || true)"
+        summary_scheduled="$(jq -r '.summary_scheduled // empty' "${response_file}" 2>/dev/null || true)"
 
         {
           echo "deployment-id=${deployment_id}"
+          echo "summary-scheduled=${summary_scheduled}"
           echo "status-code=${status_code}"
         } >> "${GITHUB_OUTPUT}"

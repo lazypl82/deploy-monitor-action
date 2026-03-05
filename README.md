@@ -27,6 +27,8 @@ jobs:
         uses: lazypl82/deploy-monitor-action@v1
         with:
           api-key: ${{ secrets.RELIVIO_PROJECT_API_KEY }}
+          environment: production
+          idempotency-key: deploy-${{ github.sha }}
 ```
 
 ## Inputs
@@ -35,14 +37,19 @@ jobs:
 - `api-base-url` (optional, default: `https://api.relivio.dev`)
 - `version` (optional, default: `GITHUB_SHA`)
 - `note` (optional)
+- `environment` (optional, default: `production`)
+- `include-github-context` (optional, default: `true`)
 - `idempotency-key` (optional)
+- `timeout-seconds` (optional, default: `15`)
 
 ## Outputs
 
 - `deployment-id`: deployment id returned by Relivio
+- `summary-scheduled`: `true` or `false`
 - `status-code`: HTTP status code
 
 ## Recommended
 
 - Set `idempotency-key: deploy-${{ github.sha }}` for retry-safe deploy registration.
 - Keep `api-key` only in GitHub Secrets.
+- Keep `include-github-context: true` to preserve repo/commit/workflow trace in deployment note.
