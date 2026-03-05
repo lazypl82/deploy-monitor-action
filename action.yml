@@ -1,0 +1,96 @@
+name: Relivio Deploy Monitor
+description: Send deployment event to Relivio.
+author: Relivio
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  api-key:
+    description: Relivio project runtime API key (X-API-Key)
+    required: true
+  api-base-url:
+    description: Relivio API base URL
+    required: false
+    default: https://api.relivio.dev
+  version:
+    description: Deployment version (defaults to GITHUB_SHA)
+    required: false
+    default: ""
+  note:
+    description: Optional deployment note
+    required: false
+    default: ""
+  idempotency-key:
+    description: Optional Idempotency-Key header
+    required: false
+    default: ""
+
+outputs:
+  deployment-id:
+    description: Deployment id returned by Relivio
+    value: ${{ steps.relivio.outputs.deployment-id }}
+  status-code:
+    description: HTTP status code returned by Relivio
+    value: ${{ steps.relivio.outputs.status-code }}
+
+runs:
+  using: composite
+  steps:
+    - id: relivio
+      shell: bash
+      env:
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_API_BASE_URL: ${{ inputs.api-base-url }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_NOTE: ${{ inputs.note }}
+        INPUT_IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
+      run: |
+        set -euo pipefail
+
+        version="${INPUT_VERSION:-}"
+        if [ -z "${version}" ]; then
+          version="${GITHUB_SHA:-}"
+        fi
+        if [ -z "${version}" ]; then
+          echo "version input is empty and GITHUB_SHA is missing" >&2
+          exit 1
+        fi
+
+        payload="$(
+          VERSION="${version}" NOTE="${INPUT_NOTE}" \
+            python3 -c 'import json, os; body={"version": os.environ["VERSION"]}; note=os.environ.get("NOTE",""); body.update({"note": note} if note else {}); print(json.dumps(body, ensure_ascii=True, separators=(",", ":")))' \
+        )"
+
+        endpoint="${INPUT_API_BASE_URL%/}/api/v1/deployments"
+        response_file="$(mktemp)"
+        trap 'rm -f "${response_file}"' EXIT
+
+        curl_args=(
+          -sS
+          -o "${response_file}"
+          -w "%{http_code}"
+          -X POST "${endpoint}"
+          -H "Content-Type: application/json"
+          -H "X-API-Key: ${INPUT_API_KEY}"
+          --data "${payload}"
+        )
+        if [ -n "${INPUT_IDEMPOTENCY_KEY}" ]; then
+          curl_args+=(-H "Idempotency-Key: ${INPUT_IDEMPOTENCY_KEY}")
+        fi
+
+        status_code="$(curl "${curl_args[@]}")"
+        body="$(cat "${response_file}")"
+
+        if [ "${status_code}" -lt 200 ] || [ "${status_code}" -ge 300 ]; then
+          echo "Relivio API request failed (HTTP ${status_code})" >&2
+          echo "${body}" >&2
+          exit 1
+        fi
+
+        deployment_id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${response_file}" | head -n 1)"
+
+        {
+          echo "deployment-id=${deployment_id}"
+          echo "status-code=${status_code}"
+        } >> "${GITHUB_OUTPUT}"
