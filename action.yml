@@ -34,7 +34,7 @@ inputs:
     required: false
     default: "true"
   idempotency-key:
-    description: Optional Idempotency-Key header
+    description: Optional Idempotency-Key header. When empty, defaults to `deploy-<version>` so re-running the same commit deduplicates to the same deployment window.
     required: false
     default: ""
   timeout-seconds:
@@ -194,9 +194,11 @@ runs:
             -H "X-API-Key: ${INPUT_API_KEY}"
             --data "${request_payload}"
           )
-          if [ -n "${INPUT_IDEMPOTENCY_KEY}" ]; then
-            curl_args+=(-H "Idempotency-Key: ${INPUT_IDEMPOTENCY_KEY}")
+          local idempotency_key="${INPUT_IDEMPOTENCY_KEY}"
+          if [ -z "${idempotency_key}" ]; then
+            idempotency_key="deploy-${version}"
           fi
+          curl_args+=(-H "Idempotency-Key: ${idempotency_key}")
           curl "${curl_args[@]}"
         }
 
